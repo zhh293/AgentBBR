@@ -6,7 +6,7 @@
 
 开发者在 Java 启动命令中加入 Agent，即可采集现有应用的完整日志事件，无须修改业务中的 `log.info()` 等调用。工具通过 Disruptor 和可扩展责任链完成脱敏、模板识别、重复折叠、业务字段提取和高亮标记。处理结果写入分级文件，在本地网页中实时查看，并可在应用退出后查看历史。
 
-使用闭环：准备 Agent 和本地 YAML → 启动应用 → 浏览器阅读处理结果 → 修改规则热更新 → 用 SPI 定制节点或整链 → 保存、查询和分享历史。
+使用闭环：准备 Agent 和本地 YAML → 启动应用 → 浏览器阅读处理结果 → 修改配置或 SPI 插件并重启应用 → 保存、查询和分享历史。
 
 第一版支持 Java 17/21、Logback Classic、一个 Agent 对应一个 JVM、本地 YAML、启动时插件加载、文件与网页。Logback 支持版本区间由兼容测试确定后发布。多 JVM 使用不同会话目录和端口。
 
@@ -48,10 +48,9 @@ flowchart TB
     K --> L[本地网页]
     J --> L
     J --> M[历史查看器与离线报告]
-    N[本地 YAML] --> O[监听、定期复查、校验与编译]
+    N[本地 YAML] --> O[启动时读取、校验与编译]
     P[SPI 插件] --> O
-    O --> Q[RELOAD 控制事件]
-    Q --> F
+    O --> G
     R[TICK 与 STOP 控制事件] --> F
 ```
 
@@ -96,25 +95,25 @@ Agent 运行时使用隔离 ClassLoader，第三方依赖按打包策略隔离/�
 
 运行时仅有一份 loglens-api。插件 ClassLoader 对 API 包父优先，共享相同类型身份；插件不得重打包 API。第一版从 YAML 指定的外部 plugins 目录加载，不默认扫描应用依赖或 Spring Boot 嵌套 JAR。明确指定 ClassLoader 调用 ServiceLoader，不依赖不确定的线程上下文加载器。
 
-插件文件按路径排序，检查 providerId 冲突和重复 API。运行时增删插件需要重启，配置热更新只引用启动时已加载的工厂。
+插件文件按路径排序，检查 providerId 冲突和重复 API。配置与插件在启动时一次性装配；修改配置或增删插件后，重启应用才能生效。
 
 ## 6. Disruptor 与线程模型
 
 | 线程 | 职责 |
 |---|---|
 | 业务日志线程 | 快照、非阻塞发布 |
-| 单消费者 | 责任链、节点状态、文件顺序写入、配置切换 |
-| 配置线程 | 读取、校验、编译候选配置 |
+| 单消费者 | 责任链、节点状态、文件顺序写入 |
+| Agent 启动线程 | 一次性读取、校验配置并装配责任链 |
 | 定时线程 | 发布 tick，不直接操作节点状态 |
 | HTTP/SSE 线程 | 历史查询与客户端推送 |
 
-RingBuffer 使用 MULTI 生产者，容量为 2 的幂。信封包含 LOG、TICK、RELOAD、STOP；控制事件由运行时消费，不经过用户日志链。单消费者使有状态节点不需要自行并发修改。
+RingBuffer 使用 MULTI 生产者，容量为 2 的幂。信封包含 LOG、TICK、STOP；控制事件由运行时消费，不经过用户日志链。单消费者使有状态节点不需要自行并发修改。
 
 默认 DROP_NEWEST：非阻塞申请槽位，满时计数并放弃工具采集。可显式启用 BLOCK，但会阻塞业务线程。第一版不覆盖未消费槽位、不宣称 ERROR 永不丢失。replace-console 下发布失败保留原控制台路径。
 
 申请、填充、提交采用 finally 提交；填充异常标记 INVALID，避免未提交序列卡住消费。先做轻量范围检查，不在占用槽位后执行耗时逻辑。消费结束清除槽位引用，节点暂存和网页推送使用独立快照。
 
-tick 可合并或在下一事件补做刷新；reload/stop 由控制线程有限等待和重试，不能静默丢失。网页慢连接不会阻塞消费；磁盘慢会拖慢消费者，表现为积压和按策略丢弃，不另建无界队列。
+tick 可合并或在下一事件补做刷新；stop 由停机协调线程有限等待和重试，不能静默丢失。网页慢连接不会阻塞消费；磁盘慢会拖慢消费者，表现为积压和按策略丢弃，不另建无界队列。
 
 事件同时保存 eventTime、capturedAt 和 captureSequence。消费顺序是接收顺序，不保证多线程事件时间严格有序。
 
@@ -187,7 +186,7 @@ META-INF/services/io.loglens.api.LogProcessorFactory
 
 窗口关闭输出 FINAL：单条为 NORMAL，多条为 AGGREGATE，包含 firstSeen、lastSeen、repeatCount 和源引用。第一版不持续更新可变摘要，因此普通折叠日志最多延迟一个窗口，ERROR 默认绕过折叠立即输出。
 
-tick、后续事件、容量驱逐、配置切换和正常停机均触发消费者刷新。maxGroups 满时提前刷新最早组，标记 CAPACITY。展开明细从存储查询，不在内存中保留全部消息。
+tick、后续事件、容量驱逐和正常停机均触发消费者刷新。maxGroups 满时提前刷新最早组，标记 CAPACITY。展开明细从存储查询，不在内存中保留全部消息。
 
 原始明细指脱敏后的捕获快照，默认不留未脱敏副本。强杀可能没有 FINAL 汇总，查看器展示已有 captured 明细并说明未完成处理，不伪造汇总。
 
@@ -267,35 +266,29 @@ web:
   port: 9527
   recentRecords: 5000
   clientQueueSize: 1000
-config:
-  watch: true
-  debounceMillis: 300
-  reconcileMillis: 5000
 ```
 
 replace-console 配合 processed=false 表示不再刷控制台，查看文件或网页。网页关闭不影响文件。
 
-### 9.1 热更新流程
+### 9.1 启动时固定配置
 
-监听配置所在目录以支持编辑器替换保存，WatchService 只作为提示，同时按内容 hash 定期检查。短暂缺失或半写文件保留有效配置。
+Agent 在 premain 中一次性读取配置文件，校验 schemaVersion、未知字段、节点 ID、provider、正则、数值范围、路径和节点顺序，然后编译规则、装配责任链。校验成功后形成不可变配置快照，整个进程生命周期使用同一份配置。
 
-校验 schemaVersion、未知字段、节点 ID、provider、正则、数值范围、路径和节点顺序。控制线程创建候选链；RELOAD 在消费线程刷新旧链、写旧结果、切新链、记录版本并关闭旧链。单条日志只使用一个 configVersion。
+所有配置变更都需要重启被接入的 Java 应用才能生效，包括采集范围、脱敏、节点启停/顺序/provider、节点参数、输出和网页设置。运行期间修改或删除配置文件，不影响已经运行的配置和责任链；不启动文件监听器或定期检查任务。
 
-第一版重建节点，首次出现等状态随版本重置，明确在页面显示。状态迁移以后另定义契约。
+启动时缺失或非法配置按第 13 节初始化失败策略处理，明确输出错误，不静默部分应用。每次重启创建新会话并重新初始化节点状态，不在会话之间迁移折叠窗口或首次出现记录。
 
-热更新：采集范围、脱敏、节点启停/顺序/provider、节点参数、展示默认值。provider 只能选已加载工厂。
-
-需重启：接管模式、切点、插件目录、缓冲容量、网页端口、输出目录与格式。包含重启项变化的配置整体拒绝，不静默部分应用。非法配置保留旧版本，在页面和诊断文件说明原因。
+会话元数据保存本次实际加载的配置摘要和 configHash，便于区分不同启动的规则。摘要不包含明文敏感值；网页显示的是已加载配置，不重新读取磁盘文件作为当前运行状态。
 
 ## 10. 数据与存储
 
 | 模型 | 关键字段 |
 |---|---|
 | CapturedLog | eventId、sessionId、captureSequence、eventTime、capturedAt、level、logger、thread、template、message、exception、MDC、truncated |
-| LogContext | 事件、configVersion、业务字段、标签、规则命中 |
+| LogContext | 事件、业务字段、标签、规则命中；固定配置通过会话关联 |
 | ProcessedRecord | recordId、recordSequence、NORMAL/AGGREGATE、level、message、firstSeen、lastSeen、repeatCount、sourceRefs |
 | RuleDecision | nodeId、ruleId、action、reason |
-| SessionMetadata | 应用、版本、开始/结束、配置历史、存储片段、丢弃计数、完成状态 |
+| SessionMetadata | 应用、运行版本、开始/结束、固定配置摘要与 configHash、存储片段、丢弃计数、完成状态 |
 
 默认只记录命中规则，逐节点耗时诊断可选。窗口使输出顺序不同于捕获顺序，两者独立编号。
 
@@ -326,11 +319,11 @@ JSONL 是可重建依据，SQLite 是查询索引，保存等级、时间、Logg
 
 ### 11.1 UI 结构
 
-- 顶栏：应用与会话、连接状态、配置版本、搜索、暂停跟随。
+- 顶栏：应用与会话、连接状态、搜索、暂停跟随。
 - 左栏：等级、Logger、标签、traceId/orderId 等筛选。
 - 中栏：虚拟滚动日志流，重复次数、持续时间、首次异常突出展示。
 - 右栏：完整消息、可折叠堆栈、MDC、关联记录、命中规则、重复明细。
-- 状态区：丢弃数量、配置错误、输出健康；技术详情按需展开。
+- 状态区：丢弃数量、输出健康；技术详情按需展开。
 
 深浅主题、克制的等级颜色、消息等宽字体、清晰行距。状态同时提供文字和图标。长消息默认截断。暂停跟随冻结滚动而不停止接收，显示新日志数量。筛选同步 URL；点击订单号创建临时关注镜头，不修改 YAML 或底层保存。
 
@@ -341,10 +334,10 @@ JSONL 是可重建依据，SQLite 是查询索引，保存等级、时间、Logg
 | GET /api/records/{id} | 详情 |
 | GET /api/records/{id}/sources | 重复明细分页 |
 | GET /api/events | SSE 记录、gap 与健康信息 |
-| GET /api/config/status | 更新状态 |
+| GET /api/config | 本次启动加载的脱敏配置摘要与 configHash |
 | GET /api/health | 缓冲与输出状态 |
 
-网页第一版只读，规则通过本地文件修改。每个 SSE 客户端队列有界，过慢时断开/通知 gap，再按序号补齐。先建立订阅并取得水位，再查询水位前历史，最后合并去重，防止历史/实时切换漏记录。
+网页第一版只读，规则通过修改本地文件并重启应用生效。每个 SSE 客户端队列有界，过慢时断开/通知 gap，再按序号补齐。先建立订阅并取得水位，再查询水位前历史，最后合并去重，防止历史/实时切换漏记录。
 
 默认仅 loopback，不开放跨域。日志按文本渲染，不用 innerHTML，限制查询大小。离线 HTML 自包含样式与脚本，安全编码内嵌数据，避免 `</script>` 逃逸；限制导出大小和 DOM 数量。
 
@@ -360,7 +353,7 @@ loglens/
 ├─ loglens-adapter-logback/   切点、快照、控制台接管
 ├─ loglens-runtime/           Disruptor、链、状态与生命周期
 ├─ loglens-processors/        默认节点与工厂
-├─ loglens-config/            YAML、校验、热更新
+├─ loglens-config/            启动时 YAML 读取、校验与不可变配置
 ├─ loglens-storage/           文本、JSONL、索引与保留
 ├─ loglens-web/               HTTP、SSE、查询
 ├─ loglens-ui/                前端，构建资源嵌入 Agent
@@ -384,7 +377,7 @@ API 不依赖日志框架、Byte Buddy、Disruptor 或前端。适配器处理�
 
 | 故障 | 行为 |
 |---|---|
-| 非法热更新 | 保留旧配置 |
+| 启动配置非法 | 初始化失败，按默认回退或 STRICT 策略处理 |
 | 节点抛异常 | 输出失败标记或按配置 DROP |
 | 插件长期阻塞 | 无法强制安全隔离，记录耗时并明确契约 |
 | 缓冲满 | 计数，接管事件走原控制台 |
@@ -396,7 +389,7 @@ API 不依赖日志框架、Byte Buddy、Disruptor 或前端。适配器处理�
 
 1. 验证接入：普通 Java 和 Spring Boot 下 Logback 事件、快照、一次采集、类加载与 observe。
 2. 实现闭环：Disruptor、默认链、SPI、窗口、分级文件、JSONL。
-3. 实现更新与接管：串行热切换、非法配置保留、直接 ConsoleAppender 接管。
+3. 实现固定配置与接管：启动校验、不可变配置、直接 ConsoleAppender 接管。
 4. 实现网页：索引、SSE、虚拟列表、详情、镜头、历史与安全导出。
 5. 验证可靠性和性能：比较未启用/observe/replace-console 的日志调用延迟、吞吐、CPU、GC、内存、磁盘和丢弃量，按实测制定目标。
 
@@ -409,7 +402,9 @@ API 不依赖日志框架、Byte Buddy、Disruptor 或前端。适配器处理�
 | 自定义节点/整链 SPI | 替换生效且外围输出完整 |
 | 多整链提供者 | 冲突明确 |
 | Spring Boot 外部插件 | 无 API 类型冲突 |
-| 保存合法/非法配置 | 旧窗口刷新/旧版本保留 |
+| 运行期间修改配置 | 当前配置和节点保持不变 |
+| 修改合法配置后重启 | 新会话使用新配置，节点状态重新初始化 |
+| 使用非法配置启动 | 明确错误并执行初始化失败策略 |
 | 日志含 HTML | 页面与导出按文本显示 |
 | 缓冲满与慢客户端 | 丢弃准确，默认不阻塞业务 |
 | 磁盘满 | 明确故障与接管回退 |
@@ -426,4 +421,4 @@ API 不依赖日志框架、Byte Buddy、Disruptor 或前端。适配器处理�
 - [Logback Appender](https://logback.qos.ch/manual/appenders.html)：分发和生命周期。
 - [Disruptor 指南](https://lmax-exchange.github.io/disruptor/user-guide/)：进程内有界缓冲与消费者序列。
 
-这些资料支持基础机制。责任链、接管策略、配置切换、存储和 UI 是本项目设计；实现前优先验证切点和类加载，不提前承诺全版本兼容或无性能开销。
+这些资料支持基础机制。责任链、接管策略、启动配置、存储和 UI 是本项目设计；实现前优先验证切点和类加载，不提前承诺全版本兼容或无性能开销。
